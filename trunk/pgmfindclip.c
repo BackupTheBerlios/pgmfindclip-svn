@@ -4,17 +4,15 @@
    written by Christian Vogelgsang <chris@lallafa.de>
    under the GNU Public License V2
 
-   $Id: pgmfindclip.c,v 1.13 2003/05/18 12:28:05 cnvogelg Exp $
+   modified 2006/09/06 by Nicolas Botti <rududu@laposte.net>
+   $Id: pgmfindclip.c,v 1.14 2006/09/06 12:28:05 cnvogelg Exp $
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
-
-/* threshold values */
-static int xthres = 100;
-static int ythres = 100;
 
 /* safety borders */
 static int xsafety = 0;
@@ -35,6 +33,9 @@ static int expand = 0;
 /* luminance only */
 static int lumionly = 0;
 
+/* output mplayer crop format */
+static int mpformat = 0;
+
 /* search offset */
 static int xoffset = 0;
 static int yoffset = 0;
@@ -44,8 +45,17 @@ static int gnuplot = 0;
 #define GNUPLOT_DATA "temp.dat"
 #define GNUPLOT_BIN "gnuplot"
 
+/* Threshold */
+#define VAR_THRES 200
+
 /* write pgm */
 static int writePGM = 0;
+
+/* clip structure */
+
+typedef struct {
+	int t, b, l, r;
+} clip;
 
 /* export data set as eps file via gnuplot */
 void saveGnuplot(char *name,
@@ -94,192 +104,254 @@ void saveGnuplot(char *name,
 
 /* ----- calc gradients ----- */
 
-/* calc difference between row y and y+1 and sum absolute diffs */
-int calcSumRowGrad(unsigned char *memory,int w,int y)
+/* apply this filter : [1 -1] */
+void calcFilter(int *memory,int w)
 {
-  int sum = 0;
-  int x;
+	int x;
 
-  /* current row */
-  unsigned char *ptr = memory + y * w;
-  /* next row */
-  unsigned char *next = ptr + w;
-
-  /* for each pixel in the row */
-  for(x=0;x<w;x++) {
-    int diff = abs(*ptr - *next);
-    sum += diff;
-
-    /* next column */
-    ptr++;
-    next++;
-  }
-  return sum;
+	/* for each pixel in the row */
+	for(x=0;x<(w-1);x++) {
+		memory[x] = abs(memory[x] - memory[x+1]);
+	}
 }
 
-/* calc difference between cell x and x+1 and sum absolute diffs */
-int calcSumColumnGrad(unsigned char *memory,int w,int h,int x)
+/* calc value sum of a row */
+void calcStatRow(unsigned char *memory, int w, int y, int * rsum, int * rvar)
 {
-  int sum = 0;
-  int y;
-
-  /* current column */
-  unsigned char *ptr = memory + x;
-  /* next column */
-  unsigned char *next = ptr + 1;
-
-  /* for each pixel in the column */
-  for(y=0;y<h;y++) {
-    int diff = abs(*ptr - *next);
-    sum += diff;
-
-    /* next row */
-    ptr+=w;
-    next+=w;
-  }
-  return sum;
+	int sum = 0;
+	long long sum2 = 0;
+	int x;
+	
+	/* current row */
+	unsigned char *ptr = memory + y * w;
+	/* for each pixel in the row */
+	for(x=0;x<w;x++) {
+		sum += *ptr;
+		sum2 += *ptr * *ptr;
+		ptr++;
+	}
+	*rsum = sum * 100 / w;
+	*rvar = sqrtf((float)(sum2 * w - sum * sum)) * 100 / w;
 }
 
-/* calc value sum of a row - grad for border case */
-int calcSumRow(unsigned char *memory,int w,int y)
+/* calc value sum of a column */
+void calcStatColumn(unsigned char *memory, int w, int h, int x, int * rsum, int * rvar)
 {
-  int sum = 0;
-  int x;
-
-  /* current row */
-  unsigned char *ptr = memory + y * w;
-  /* for each pixel in the row */
-  for(x=0;x<w;x++) {
-    sum += *ptr;
-    ptr++;
-  }
-  return sum;
+	int sum = 0;
+	long long sum2 = 0;
+	int y;
+	
+	/* current column */
+	unsigned char *ptr = memory + x;
+	/* for each pixel in the column */
+	for(y=0;y<h;y++) {
+		sum += *ptr;
+		sum2 += *ptr * *ptr;
+		ptr+=w;
+	}
+	*rsum = sum * 100 / h;
+	*rvar = sqrtf((float)(sum2 * h - sum * sum)) * 100 / h;
 }
 
-/* calc value sum of a column - grad for border case */
-int calcSumColumn(unsigned char *memory,int w,int h,int x)
+/* Find the clip value */
+/* memory : start position */
+/* w : lenth to search */
+/* dir : direction for finding (1 or -1) */
+/* retThres : return Thres used to find the candidate */
+int findClipCandidate(int *memory, int * var, int w, int dir, int * retThres)
 {
-  int sum = 0;
-  int y;
+	int i, j = 0, istart, jstart, state = 0, zeros = 0;
+	int sum = 0, count = 0, thres;
+	long long sum2 = 0;
+	for (i = 0; i < w; i++, j += dir)
+		if (var[j] > VAR_THRES)
+			break;
+	if (i==w)
+		return -1;
+	i -= 4;
+	j -= 4 * dir;
+	if (i < 0){
+		 i = 0;
+		 j = 0;
+	}
+	if (i+32 < w)
+		w = i+32;
+	istart = i;
+	jstart = j;
+	for (; i < w; i++, j += dir){
+		sum += memory[j];
+		sum2 += memory[j] * memory[j];
+	}
+	sum2 = sqrtf((float)(sum2 * (w-istart) - sum * sum) / ((w-istart) * (w-istart)));
+	sum = sum / (w-istart);
+	thres = sum + 2 * sum2;
 
-  /* current column */
-  unsigned char *ptr = memory + x;
-  /* for each pixel in the column */
-  for(y=0;y<h;y++) {
-    sum += *ptr;
-    ptr+=w;
-  }
-  return sum;
+	sum2 = sum = 0;
+	for (i = istart, j = jstart; i < w; i++, j += dir){
+		if (memory[j] < thres){
+			sum += memory[j];
+			sum2 += memory[j] * memory[j];
+			count++;
+		}
+	}
+
+	if (count == 0)
+		return -1;
+	
+	sum2 = sqrtf((float)(sum2 * count - sum * sum) / (count * count));
+	sum = sum / count;
+	thres = 2 * sum + 6 * sum2;
+	*retThres = thres;
+	
+	for (i = istart, j = jstart; i < w; i++, j += dir){
+		if (var[j] <= VAR_THRES)
+			zeros++;
+		if (memory[j] > thres){
+			thres = sum + 3 * sum2;
+			state |= 1;
+		}else{
+			if (state & 1 /*&& memory[j+dir] <= thres*/)
+				break;
+		}
+	}
+	if (!(state & 1)){
+		if (istart == 0)
+			return 0;
+		return -1;
+	}else if (istart == 0 && i > 8 && zeros < 3)
+		return 0;
+	return i;
 }
 
-/* normalize sum and scale */
-int norm(int sum,int len)
+int findClip(int *memory, int * var, int w, int dir)
 {
-  return(sum * 100 / len);
+	int Candidates[8];
+	int Thres[8];
+	int NbCand = 1, i, j = 0, state=0;
+	int MaxThres = 0;
+
+	Candidates[0] = findClipCandidate(memory, var, w, dir, Thres);
+
+	for (i = 0; i < w; i++, j+=dir){
+		if (var[j] > VAR_THRES){
+			if (var[j] > VAR_THRES * 4)
+				break;
+			state=1;
+		} else if (state > 0){
+			state++;
+			if (state > 3){
+				state = 0;
+				Candidates[NbCand] = findClipCandidate(memory + j, var + j, w - i, dir, Thres + NbCand);
+				if (Candidates[NbCand] >= 0)
+					Candidates[NbCand] += i;
+				NbCand++;
+				if (NbCand == 8)
+					break;
+			}
+		}
+	}
+
+	j = -1;
+	for (i = 0; i < NbCand; i++){
+		if (Candidates[i] >= 0 && Thres[i] > MaxThres){
+			MaxThres = Thres[i];
+			j = Candidates[i];
+		}
+	}
+	return j;
 }
+
 
 /* ----- the main clipping algorithm ----- */
 int findClipBorders(char *name,
 		    unsigned char *memory,int width,int height,
 		    int *l,int *r,int *t,int *b)
 {
-  int *yd;
-  int *xd;
-  int x,y;
-  int w,h;
-  int fullx;
-  int fully;
+	int *yd, *xd, *yv, *xv;
+	int x,y;
+	int w,h;
+	int fullx = 0;
+	int fully = 0;
+// 	FILE *fh;
+	
+	/* reset values */
+	*l = *r = width;
+	*t = *b = height;
+	
+	/* number of differences */
+	w = width;
+	h = height;
+	
+	/* ydiffs and xdiffs */
+	yd = (int *)malloc(sizeof(int)*h);
+	xd = (int *)malloc(sizeof(int)*w);
+	
+	/* variances */
+	yv = (int *)malloc(sizeof(int)*h);
+	xv = (int *)malloc(sizeof(int)*w);
+	
+	
+	/* calc all sums */
+	for(x=0;x < width;x++)
+		calcStatColumn(memory,width,height,x, xd + x, xv + x);
+	
+	for(y=0;y < height;y++)
+		calcStatRow(memory,width,y, yd + y, yv + y);
+	
+	/* calc grad */
+	calcFilter(xd, width);
+	calcFilter(yd, height);
 
-  /* reset values */
-  *l = *r = width;
-  *t = *b = height;
-
-  /* number of differences "between" the columns/rows + 2 borders */
-  w = width+1;
-  h = height+1;
-
-  /* ydiffs and xdiffs */
-  yd = (int *)malloc(sizeof(int)*h);
-  xd = (int *)malloc(sizeof(int)*w);
-
-  /* calc all differences */
-  xd[0] = norm(calcSumColumn(memory,width,height,0),height);
-  for(x=0;x<(width-1);x++) 
-    xd[x+1] = norm(calcSumColumnGrad(memory,width,height,x),height);
-  xd[width] = norm(calcSumColumn(memory,width,height,width-1),height);
-
-  yd[0] = norm(calcSumRow(memory,width,0),width);
-  for(y=0;y<(height-1);y++)
-    yd[y+1] = norm(calcSumRowGrad(memory,width,y),width);
-  yd[height] = norm(calcSumRow(memory,width,height-1),width);
-
-  /* verbose mode */
-  if(verbose) {
-    fprintf(stderr,"xsumgrad: ");
-    for(x=0;x<w;x++)
-      fprintf(stderr,"%d ",xd[x]);
-    fprintf(stderr,"- xthreshold=%d\n",xthres);
-    fprintf(stderr,"ysumgrad: ");
-    for(y=0;y<h;y++)
-      fprintf(stderr,"%d ",yd[y]);
-    fprintf(stderr,"- ythreshold=%d\n",ythres);
-  }
-
-  /* ----- vertical operation ----- */
-  /* find top clip */
-  for(y=yoffset;y<h-yoffset;y++) {
-    if(yd[y]>=ythres) {
-      *t = y;
-      break;
-    }
-  }
-  /* no top clip -> full region */
-  if(y==h) {
-    *t = *b = 0;
-    fully = 1;
-  } else {
-    fully = 0;
-    /* find bot clip */
-    for(y=yoffset;y<h-yoffset;y++) {
-      if(yd[h-y-1]>=ythres) {
-	*b = y;
-	break;
-      }
-    }
-    /* same threshold -> no clipping useful */
-    if(*b + *t == height) {
-      *t = *b = 0;
-      fully = 1;
-    }
-  }
-
-  /* ----- horizontal operation ----- */
-  /* find left clip */
-  for(x=xoffset;x<w-xoffset;x++) {
-    if(xd[x]>=xthres) {
-      *l = x;
-      break;
-    }
-  }
-  /* no left clip -> use full region */
-  if(x==w) {
-    *l = *r = 0;
-    fullx = 1;
-  } else {
-    fullx = 0;
-    /* find bot clip */
-    for(x=xoffset;x<w-xoffset;x++) {
-      if(xd[w-x-1]>=xthres) {
-	*r = x;
-	break;
-      }
-    }
-    /* same threshold -> no clipping useful */
-    if(*l + *r == width) {
-      *l = *r = 0;
-      fullx = 1;
-    }
-  }
+// 	fh = fopen("h.dat","w");
+// 	if(fh==0) {
+// 		fprintf(stderr,"Error opening file \n");
+// 		return 0;
+// 	}
+// 	for(x=0;x<width;x++)
+// 		fprintf(fh,"%d %d %d\n",x,xd[x],xv[x]);
+// 	fclose(fh);
+// 
+// 	fh = fopen("v.dat","w");
+// 	if(fh==0) {
+// 		fprintf(stderr,"Error opening file \n");
+// 		return 0;
+// 	}
+// 	for(y=0;y<width;y++)
+// 		fprintf(fh,"%d %d %d\n",y,yd[y],yv[y]);
+// 	fclose(fh);
+	
+	/* verbose mode */
+	if(verbose) {
+		fprintf(stderr,"xsumgrad: ");
+		for(x=0;x<w-1;x++)
+		fprintf(stderr,"%d ",xd[x]);
+		fprintf(stderr,"\nysumgrad: ");
+		for(y=0;y<h-1;y++)
+		fprintf(stderr,"%d ",yd[y]);
+		fprintf(stderr,"\n");
+	}
+	
+	/* ----- vertical operation ----- */
+	if (yoffset == 0)
+		yoffset = height - 1;
+	if (yoffset > height - 1)
+		yoffset = height - 1;
+	*t = findClip(yd, yv, yoffset, 1);
+	*b = findClip(yd + height - 2, yv + height - 1, yoffset, -1);
+	
+	if (*t < 0 || *b < 0 || (height - *b - *t) < (height >> 2))
+		fully = 1;
+	
+	/* ----- horizontal operation ----- */
+	if (xoffset == 0)
+		xoffset = width - 1;
+	if (xoffset > width - 1)
+		xoffset = width - 1;
+	*l = findClip(xd, xv, xoffset, 1);
+	*r = findClip(xd + width - 2, xv + width - 1, xoffset, -1);
+	
+	if (*l < 0 || *r < 0 || (width - *r - *l) < (width >> 2))
+		fullx = 1;
 
   /* gnuplot output */
   if(gnuplot) {
@@ -294,9 +366,9 @@ int findClipBorders(char *name,
     if(file!=NULL) {
       strcpy(file,name);
       strcpy(file+len,"-x.eps");
-      saveGnuplot(file,xd,w,*l,w-1-*r,xoffset,xthres);
+      saveGnuplot(file,xd,w,*l,w-1-*r,xoffset,0);
       file[len+1] = 'y';
-      saveGnuplot(file,yd,h,*t,h-1-*b,yoffset,ythres);
+      saveGnuplot(file,yd,h,*t,h-1-*b,yoffset,0);
       free(file);
     }
   }
@@ -304,7 +376,7 @@ int findClipBorders(char *name,
   free(xd);
   free(yd);
 
-  return(!(fullx && fully));
+  return(!(fullx || fully));
 }
 
 /* read the next header line of pgm file */
@@ -314,7 +386,7 @@ unsigned char *readHeaderLine(FILE *fh)
 
   do {
     /* read error */
-    if(fgets(buf,1023,fh)==0) {
+	  if(fgets((char *)buf,1023,fh)==0) {
       fprintf(stderr,"Read Error!\n");
       return 0;
     }
@@ -328,60 +400,60 @@ unsigned char *readHeaderLine(FILE *fh)
 /* read a gray level pgm image */
 unsigned char *readPGMFile(const char *file,int *width,int *height)
 {
-  unsigned char *memory;
-  unsigned char *line;
-  FILE *fh;
-  int size;
-  int dummy;
-
-  /* open pgm image */
-  fh = fopen(file,"r");
-  if(fh==0) {
-    fprintf(stderr,"Can't open '%s'\n",file);
-    return 0;
-  }
-  /* read pgm header */
-  line = readHeaderLine(fh);
-  if(strcmp("P5\n",line)!=0) {
-    fprintf(stderr,"No P5 pgm!\n");
-    return 0;
-  }
-  /* read image dimension */
-  line = readHeaderLine(fh);
-  if(sscanf(line,"%d %d %d",width,height,&dummy)!=3) {
-    if(sscanf(line,"%d %d",width,height)!=2) {
-      fprintf(stderr,"No dimension in pgm found!\n");
-      fclose(fh);
-      return 0;
-    }
-    /* skip component max value */
-    line = readHeaderLine(fh);
-  }
-
-  /* load only the lumi part of a mplayer pgm file */
-  if(lumionly)
-    *height = *height * 2 / 3;
-
-  /* get memory */
-  size = *width * *height;
-  memory = (unsigned char *)malloc(size);
-  if(memory==0) {
-    fprintf(stderr,"Out of memory!\n");
-    fclose(fh);
-    return 0;
-  }
-  /* read data */
-  if(fread(memory,size,1,fh)!=1) {
-    fprintf(stderr,"Read error while fetching raw data!\n");
-    free(memory);
-    fclose(fh);
-    return 0;
-  }
-
-  /* close file */
-  fclose(fh);
-
-  return memory;
+	unsigned char *memory;
+	unsigned char *line;
+	FILE *fh;
+	int size;
+	int dummy;
+	
+	/* open pgm image */
+	fh = fopen(file,"r");
+	if(fh==0) {
+		fprintf(stderr,"Can't open '%s'\n",file);
+		return 0;
+	}
+	/* read pgm header */
+	line = readHeaderLine(fh);
+	if(strcmp("P5\n",(char *)line)!=0) {
+		fprintf(stderr,"No P5 pgm!\n");
+		return 0;
+	}
+	/* read image dimension */
+	line = readHeaderLine(fh);
+	if(sscanf((char *)line,"%d %d %d",width,height,&dummy)!=3) {
+		if(sscanf((char *)line,"%d %d",width,height)!=2) {
+			fprintf(stderr,"No dimension in pgm found!\n");
+			fclose(fh);
+			return 0;
+		}
+		/* skip component max value */
+		line = readHeaderLine(fh);
+	}
+	
+	/* load only the lumi part of a mplayer pgm file */
+	if(lumionly)
+		*height = *height * 2 / 3;
+	
+	/* get memory */
+	size = *width * *height;
+	memory = (unsigned char *)malloc(size);
+	if(memory==0) {
+		fprintf(stderr,"Out of memory!\n");
+		fclose(fh);
+		return 0;
+	}
+	/* read data */
+	if(fread(memory,size,1,fh)!=1) {
+		fprintf(stderr,"Read error while fetching raw data!\n");
+		free(memory);
+		fclose(fh);
+		return 0;
+	}
+	
+	/* close file */
+	fclose(fh);
+	
+	return memory;
 }
 
 /* fmodulo alignment - align to smaller block */
@@ -448,6 +520,107 @@ void alignFrame(int *l,int *r,int w,int fmod,int bmod)
   *r = right;
 }
 
+int clipComp(clip * a, clip * b)
+{
+	if (a->t == b->t && a->b == b->b && a->l == b->l && a->r == b->r)
+		return 1;
+	return 0;
+}
+
+/* filters all the valid borders found */
+void findBorders(clip * clips, int count)
+{
+	int * counts = (int*)malloc(sizeof(int) * count);
+	clip * b = (clip*)malloc(sizeof(clip) * count);
+	clip sum = {0,0,0,0};
+	clip sum2 = {0,0,0,0};
+	int i, c;
+	int min_count;
+
+	if (count == 1)
+		return;
+
+	b[0] = clips[0];
+	c = 1;
+	counts[c] = 1;
+
+	for (i = 0; i < count; i++){
+		int j = 0;
+		for (j = 0; j < c; j++)
+			if (clipComp(b+j,clips+i))
+				break;
+		if (j == c){
+			b[c] = clips[i];
+			counts[c] = 1;
+			c++;
+		}else{
+			counts[j]++;
+		}
+	}
+
+	min_count = count / 64;
+	count = 0;
+
+	for (i = 0; i < c; i++){
+		if (counts[i] >= min_count){
+			counts[count] = counts[i];
+			b[count] = b[i];
+			count++;
+		}
+	}
+
+	c = count;
+	count = 0;
+
+	if(verbose)
+		for (i = 0; i < c; i++)
+			fprintf(stderr,"[%d,%d,%d,%d] : %d\n",b[i].t,b[i].l,b[i].b,b[i].r,counts[i]);
+
+	for (i = 0; i < c; i++){
+		sum.t += b[i].t * counts[i];
+		sum.b += b[i].b * counts[i];
+		sum.l += b[i].l * counts[i];
+		sum.r += b[i].r * counts[i];
+		sum2.t += b[i].t * b[i].t * counts[i];
+		sum2.b += b[i].b * b[i].b * counts[i];
+		sum2.l += b[i].l * b[i].l * counts[i];
+		sum2.r += b[i].r * b[i].r * counts[i];
+		count += counts[i];
+	}
+
+	/* standard deviation * 100 */
+	sum2.t = sqrtf((float)((float)sum2.t * count - sum.t * sum.t) / (count * count)) * 100;
+	sum2.b = sqrtf((float)((float)sum2.b * count - sum.b * sum.b) / (count * count)) * 100;
+	sum2.l = sqrtf((float)((float)sum2.l * count - sum.l * sum.l) / (count * count)) * 100;
+	sum2.r = sqrtf((float)((float)sum2.r * count - sum.r * sum.r) / (count * count)) * 100;
+	/* valid value range */
+	sum.t = (sum.t * 100 / count + sum2.t * 2 + 50) / 100;
+	sum.b = (sum.b * 100 / count + sum2.b * 2 + 50) / 100;
+	sum.l = (sum.l * 100 / count + sum2.l * 2 + 50) / 100;
+	sum.r = (sum.r * 100 / count + sum2.r * 2 + 50) / 100;
+
+	sum2.t = sum2.b = sum2.l = sum2.r = 0;
+
+	for (i = 0; i < c; i++){
+		if (b[i].t > sum2.t && b[i].t <= sum.t)
+			sum2.t = b[i].t;
+		if (b[i].b > sum2.b && b[i].b <= sum.b)
+			sum2.b = b[i].b;
+		if (b[i].l > sum2.l && b[i].l <= sum.l)
+			sum2.l = b[i].l;
+		if (b[i].r > sum2.r && b[i].r <= sum.r)
+			sum2.r = b[i].r;
+	}
+
+	clips[0].t =sum2.t;
+	clips[0].b =sum2.b;
+	clips[0].l =sum2.l;
+	clips[0].r =sum2.r;
+
+	free (counts);
+	free (b);
+}
+
 /* move and align border values */
 void modifyBorders(int *l,int *r,int *t,int *b,int width,int height)
 {
@@ -503,8 +676,8 @@ void writeMarkers(char *name,unsigned char *memory,int w,int h,
   char *ptr1,*ptr2;
 
   /* draw vertical markers */
-  ptr1 = memory +  t    * w + l;
-  ptr2 = memory + (t+1) * w - 1 - r;
+  ptr1 = (char *)memory +  t    * w + l;
+  ptr2 = (char *)memory + (t+1) * w - 1 - r;
   for(y=t;y<(h-b);y++) {
     *ptr1 = 255 - *ptr1;
     *ptr2 = 255 - *ptr2;
@@ -513,8 +686,8 @@ void writeMarkers(char *name,unsigned char *memory,int w,int h,
   }
 
   /* draw horizontal markers */
-  ptr1 = memory +  t      * w + l + 1;
-  ptr2 = memory + (h-1-b) * w + l + 1;
+  ptr1 = (char *)memory +  t      * w + l + 1;
+  ptr2 = (char *)memory + (h-1-b) * w + l + 1;
   for(x=l+1;x<(w-r-1);x++) {
     *ptr1 = 255 - *ptr1;
     *ptr2 = 255 - *ptr2;
@@ -552,17 +725,17 @@ void usage(void)
 "  under the GNU Public License V2\n"
 "  $Revision: 1.13 $\n\n"	  
 "Usage: pgmfindclip [Options] <image.pgm> ...\n\n"
-" -t <thres>[,<ythres>]     set threshold values    (default: %d,%d)\n"
 " -s <safety>[,<ysafety>]   add a safety border     (default: none)\n"
 " -b <modulo>[,<ymodulo>]   align clip borders      (default: none)\n"
 " -f <modulo>[,<ymodulo>]   align output frame size (default: none)\n"
 " -o <offset>[,<yoffset>]   search begin offset     (default: 0 0)\n"
 " -e                        expand and do not shrink in frame alignment\n"
 " -y                        input pgm files are yuv files from mplayer\n"
+" -m                        output formated for mencoder crop\n"
 " -v                        enable verbose mode\n"
 " -p                        plot results to *x.eps, *y.eps (req. gnuplot)\n"
 " -w                        write PGM files with border markers (*-m.pgm)\n"
-	  ,xthres,ythres);
+		 );
   exit(1);
 }
 
@@ -584,17 +757,14 @@ void twoValArg(char *str,int *v1,int *v2)
 int main(int argc,char *argv[])
 {
   int i;
-  int top,bottom,left,right;
-  int width,height;
+  int width,height,left,right,top,bottom;
   int count;
+  clip * clips;
 
   /* parse args */
   int c;
-  while((c=getopt(argc,argv,"t:s:f:b:o:veypw"))!=-1) {
+  while((c=getopt(argc,argv,"s:f:b:o:veypwm"))!=-1) {
     switch(c) {
-    case 't':
-      twoValArg(optarg,&xthres,&ythres);
-      break;
     case 's':
       twoValArg(optarg,&xsafety,&ysafety);
       break;
@@ -616,6 +786,9 @@ int main(int argc,char *argv[])
     case 'y':
       lumionly = 1;
       break;
+	case 'm':
+	  mpformat = 1;
+	  break;
     case 'p':
       gnuplot = 1;
       break;
@@ -631,15 +804,9 @@ int main(int argc,char *argv[])
   if(optind == argc)
     usage();
 
-#define MAX 2048
-
-  top    = MAX;
-  bottom = MAX;
-  left   = MAX;
-  right  = MAX;
-
   /* loop over images */
   count = 0;
+  clips = (clip *)malloc(sizeof(clip)*(argc-optind));
   for(i=optind;i<argc;i++) {
     int l,r,t,b;
     unsigned char *memory;
@@ -654,24 +821,19 @@ int main(int argc,char *argv[])
     /* ----- Find Crop Border ----- */
     if(findClipBorders(argv[i],memory,width,height,&l,&r,&t,&b)) {
       if(verbose)
-	fprintf(stderr,"image (%d x %d) clip: t=%d l=%d b=%d r=%d\n",
-		width,height,t,l,b,r);
+		fprintf(stderr,"image (%d x %d) clip: t=%d l=%d b=%d r=%d\n",
+			width,height,t,l,b,r);
 
-      /* keep largest region */
-      if(l<left)
-	left = l;
-      if(r<right)
-	right = r;
-      if(t<top)
-	top = t;
-      if(b<bottom)
-	bottom = b;
+	  clips[count].t = t;
+	  clips[count].b = b;
+	  clips[count].l = l;
+	  clips[count].r = r;
 
       /* count valid images */
       count++;
     } else {
       if(verbose)
-	fprintf(stderr,"no clip region found!\n");
+		fprintf(stderr,"no clip region found!\n");
     }
 
     /* free memory */
@@ -681,17 +843,15 @@ int main(int argc,char *argv[])
     fprintf(stderr,"No valid images found!\n");
     exit(1);
   }
-  
-  /* consistency check */
-  if(top > (height-1-bottom)) {
-    fprintf(stderr,"Inconsistency along Y - ignoring values!\n");
-    top = bottom = 0;
-  }
-  if(left > (width-1-right)) {
-    fprintf(stderr,"Inconsistency along X - ignoring values!\n");
-    left = right = 0;
-  }
 
+  findBorders(clips, count);
+  
+  left = clips[0].l;
+  right = clips[0].r;
+  top = clips[0].t;
+  bottom = clips[0].b;
+  
+  free(clips);
   /* move and align the clip borders */
   modifyBorders(&left,&right,&top,&bottom,width,height);
 
@@ -704,8 +864,12 @@ int main(int argc,char *argv[])
     }
   }
 
-  /* generate transcode-friendly result */
-  printf("%d,%d,%d,%d\n",top,left,bottom,right);
+  if (mpformat)
+	  printf("%d:%d:%d:%d\n",width - left - right, height - top - bottom, left,top);
+  else
+	/* generate transcode-friendly result */
+	printf("%d,%d,%d,%d\n",top,left,bottom,right);
+
 
   exit(0);
 }
